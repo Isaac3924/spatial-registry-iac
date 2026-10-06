@@ -1,0 +1,18 @@
+# Local .terraform directories
+**/.terraform/*
+
+# .tfstate files
+*.tfstate
+*.tfstate.*
+
+# Crash log files
+crash.log
+crash.*.log
+
+# CLI configuration files
+.terraformrc
+terraform.rc
+
+# Variable definition files
+*.tfvars
+*.tfvars.json
