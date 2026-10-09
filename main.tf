@@ -200,6 +200,104 @@ resource "aws_ecs_service" "api" {
 }
 
 ###############################################################################
+# CI/CD Infrastructure (GitHub Actions OIDC)
+###############################################################################
+
+data "aws_caller_identity" "current" {}
+
+# GitHub's OIDC token endpoint certificate, fetched dynamically so the
+# provider's trust thumbprint always matches GitHub's current CA.
+data "tls_certificate" "github_actions" {
+  url = "https://token.actions.githubusercontent.com/.well-known/openid-configuration"
+}
+
+resource "aws_iam_openid_connect_provider" "github_actions" {
+  url             = "https://token.actions.githubusercontent.com"
+  client_id_list  = ["sts.amazonaws.com"]
+  thumbprint_list = [data.tls_certificate.github_actions.certificates[0].sha1_fingerprint]
+
+  tags = {
+    Name = "${var.project_name}-github-actions-oidc"
+  }
+}
+
+data "aws_iam_policy_document" "github_actions_assume_role" {
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+
+    principals {
+      type        = "Federated"
+      identifiers = [aws_iam_openid_connect_provider.github_actions.arn]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:aud"
+      values   = ["sts.amazonaws.com"]
+    }
+
+    # Restricts assumption to workflows running in this exact repository.
+    condition {
+      test     = "StringLike"
+      variable = "token.actions.githubusercontent.com:sub"
+      values   = ["repo:Isaac3924/spatial-registry:*"]
+    }
+  }
+}
+
+resource "aws_iam_role" "github_actions" {
+  name               = "spatial-registry-github-actions-role"
+  assume_role_policy = data.aws_iam_policy_document.github_actions_assume_role.json
+
+  tags = {
+    Name = "spatial-registry-github-actions-role"
+  }
+}
+
+data "aws_iam_policy_document" "github_actions_permissions" {
+  statement {
+    sid       = "ECRAuthToken"
+    effect    = "Allow"
+    actions   = ["ecr:GetAuthorizationToken"]
+    resources = ["*"]
+  }
+
+  statement {
+    sid    = "ECRPushImage"
+    effect = "Allow"
+    actions = [
+      "ecr:BatchCheckLayerAvailability",
+      "ecr:InitiateLayerUpload",
+      "ecr:UploadLayerPart",
+      "ecr:CompleteLayerUpload",
+      "ecr:PutImage",
+      "ecr:BatchGetImage",
+      "ecr:GetDownloadUrlForLayer",
+    ]
+    resources = [aws_ecr_repository.api.arn]
+  }
+
+  statement {
+    sid       = "ECSUpdateService"
+    effect    = "Allow"
+    actions   = ["ecs:UpdateService"]
+    resources = ["arn:aws:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:service/${aws_ecs_cluster.main.name}/${aws_ecs_service.api.name}"]
+  }
+}
+
+resource "aws_iam_policy" "github_actions" {
+  name        = "spatial-registry-github-actions-policy"
+  description = "Allows GitHub Actions to push images to ECR and update the spatial-registry ECS service"
+  policy      = data.aws_iam_policy_document.github_actions_permissions.json
+}
+
+resource "aws_iam_role_policy_attachment" "github_actions" {
+  role       = aws_iam_role.github_actions.name
+  policy_arn = aws_iam_policy.github_actions.arn
+}
+
+###############################################################################
 # Outputs
 ###############################################################################
 
@@ -216,4 +314,9 @@ output "ecs_cluster_name" {
 output "ecs_service_name" {
   description = "Name of the ECS service"
   value       = aws_ecs_service.api.name
+}
+
+output "github_actions_role_arn" {
+  description = "ARN of the IAM role GitHub Actions assumes via OIDC to deploy the service"
+  value       = aws_iam_role.github_actions.arn
 }

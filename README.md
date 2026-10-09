@@ -8,11 +8,12 @@ This repository contains the Terraform configuration to provision the cloud-nati
 - **Compute:** Amazon ECS Cluster running on AWS Fargate (serverless compute), configured with 512 CPU and 1024 MiB memory.
 - **Container Registry:** Amazon ECR repository for securely storing the multi-stage Spring Boot Docker image.
 - **Security & IAM:** Dedicated Security Group exposing port 8080, combined with an ECS Task Execution IAM Role for secure service communication.
+- **CI/CD Integration (OIDC):** OpenID Connect trust relationship established between AWS and GitHub Actions. Uses a dynamically verified certificate and least-privilege IAM role to enable secure, passwordless deployment directly from GitHub to AWS.
 - **Observability:** Integrated AWS CloudWatch log groups for centralized container logging and monitoring.
 
 ## Repository Structure
 
-- `main.tf`: Core infrastructure resources (VPC, Subnets, ECS, ECR, IAM, Security Groups).
+- `main.tf`: Core infrastructure resources (VPC, Subnets, ECS, ECR, IAM, OIDC, Security Groups).
 - `variables.tf`: Input variables for environment customization (Region, CIDR blocks, Task sizing).
 - `providers.tf`: Terraform and AWS provider version constraints.
 - `INFRA_SPEC.md`: The original architecture specification used for Spec-Driven Development.
@@ -45,6 +46,9 @@ Authenticate Docker with your new ECR registry, build the `spatial-registry-api`
 ```bash
 terraform apply
 ```
+
+**5. Configure CI/CD Secrets**
+Upon succesful apply, Terraform will output a `github_actions_role_arn`. Copy this ARN and add it as a repository secret named `AWS_ROLE_ARN` in your application repositroy to enable automated GitHub Actions deployments.
 
 ## Teardown
 

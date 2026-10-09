@@ -18,8 +18,14 @@ Provision cloud-native AWS infrastructure using Terraform to host a containerize
 - **Security & IAM:**
   - 1 Security Group allowing inbound TCP on port 8080 from anywhere (0.0.0.0/0) and all outbound traffic
   - 1 ECS Task Execution IAM Role with the `AmazonECSTaskExecutionRolePolicy` managed policy attached
+- **CI/CD Infrastructure (GitHub Actions OIDC):**
+  - Create an AWS IAM OpenID connect provider for `token.actions.githubusercontent.com` with audience `sts.amazonaws.com`.
+  - Create an IAM role named `spatial-registry-github-actions-role` that assumes web identity via the OIDC provider.
+  - Restrict the `sub` claim condition to exactly `repo:Isaac3924/spatial-registry:*`.
+  - Attach an IAM policy to the role allowing ECR authentication/uploading (batch check, initiate layer upload, put image, etc.) and ECS service updating (`ecs:UpdateService`) for the `spatial-registry-service`.
 
 ## 3. Required Outputs
 - ECR Repository URL
 - ECS Cluster Name
 - ECS Service Name
+- GitHub Actions Role ARN
