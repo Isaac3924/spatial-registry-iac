@@ -241,7 +241,9 @@ data "aws_iam_policy_document" "github_actions_assume_role" {
     condition {
       test     = "StringLike"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:Isaac3924/spatial-registry:*"]
+      values   = [
+        "repo:Isaac3924@17149928/spatial-asset-registry@1400691459:*"
+      ]
     }
   }
 }
