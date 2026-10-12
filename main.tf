@@ -200,6 +200,132 @@ resource "aws_ecs_service" "api" {
 }
 
 ###############################################################################
+# Frontend Hosting (S3 & CloudFront)
+###############################################################################
+
+# Bucket name includes the account ID to satisfy S3's global uniqueness
+# requirement without introducing a new provider or variable.
+resource "aws_s3_bucket" "frontend" {
+  bucket        = "${var.project_name}-ui-${data.aws_caller_identity.current.account_id}"
+  force_destroy = true
+
+  tags = {
+    Name = "${var.project_name}-ui"
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "frontend" {
+  bucket = aws_s3_bucket.frontend.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_ownership_controls" "frontend" {
+  bucket = aws_s3_bucket.frontend.id
+
+  rule {
+    object_ownership = "BucketOwnerEnforced"
+  }
+}
+
+resource "aws_cloudfront_origin_access_control" "frontend" {
+  name                              = "${var.project_name}-ui-oac"
+  description                       = "OAC allowing CloudFront to read from the frontend S3 bucket"
+  origin_access_control_origin_type = "s3"
+  signing_behavior                  = "always"
+  signing_protocol                  = "sigv4"
+}
+
+resource "aws_cloudfront_distribution" "frontend" {
+  enabled             = true
+  default_root_object = "index.html"
+  comment             = "${var.project_name} frontend distribution"
+
+  origin {
+    domain_name              = aws_s3_bucket.frontend.bucket_regional_domain_name
+    origin_id                = "${var.project_name}-ui-origin"
+    origin_access_control_id = aws_cloudfront_origin_access_control.frontend.id
+  }
+
+  default_cache_behavior {
+    allowed_methods        = ["GET", "HEAD"]
+    cached_methods         = ["GET", "HEAD"]
+    target_origin_id       = "${var.project_name}-ui-origin"
+    viewer_protocol_policy = "redirect-to-https"
+    compress               = true
+
+    forwarded_values {
+      query_string = false
+
+      cookies {
+        forward = "none"
+      }
+    }
+  }
+
+  # Vue Router uses client-side (history-mode) routing, so any path CloudFront
+  # can't find as an S3 object must fall back to index.html and return 200
+  # rather than a raw 403/404 so the SPA can handle the route itself.
+  custom_error_response {
+    error_code         = 403
+    response_code      = 200
+    response_page_path = "/index.html"
+  }
+
+  custom_error_response {
+    error_code         = 404
+    response_code      = 200
+    response_page_path = "/index.html"
+  }
+
+  restrictions {
+    geo_restriction {
+      restriction_type = "none"
+    }
+  }
+
+  viewer_certificate {
+    cloudfront_default_certificate = true
+  }
+
+  tags = {
+    Name = "${var.project_name}-ui-distribution"
+  }
+}
+
+# Grants the CloudFront distribution (and only this distribution, via the
+# aws:SourceArn condition) read access through OAC, keeping the bucket itself
+# fully private.
+data "aws_iam_policy_document" "frontend_bucket_policy" {
+  statement {
+    sid    = "AllowCloudFrontServicePrincipalReadOnly"
+    effect = "Allow"
+
+    principals {
+      type        = "Service"
+      identifiers = ["cloudfront.amazonaws.com"]
+    }
+
+    actions   = ["s3:GetObject"]
+    resources = ["${aws_s3_bucket.frontend.arn}/*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "AWS:SourceArn"
+      values   = [aws_cloudfront_distribution.frontend.arn]
+    }
+  }
+}
+
+resource "aws_s3_bucket_policy" "frontend" {
+  bucket = aws_s3_bucket.frontend.id
+  policy = data.aws_iam_policy_document.frontend_bucket_policy.json
+}
+
+###############################################################################
 # CI/CD Infrastructure (GitHub Actions OIDC)
 ###############################################################################
 
@@ -241,7 +367,7 @@ data "aws_iam_policy_document" "github_actions_assume_role" {
     condition {
       test     = "StringLike"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = [
+      values = [
         "repo:Isaac3924@17149928/spatial-asset-registry@1400691459:*"
       ]
     }
@@ -299,6 +425,81 @@ resource "aws_iam_role_policy_attachment" "github_actions" {
   policy_arn = aws_iam_policy.github_actions.arn
 }
 
+# Frontend GitHub Actions role - reuses the OIDC provider above, scoped to
+# the spatial-registry-ui repository.
+data "aws_iam_policy_document" "ui_github_actions_assume_role" {
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+
+    principals {
+      type        = "Federated"
+      identifiers = [aws_iam_openid_connect_provider.github_actions.arn]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:aud"
+      values   = ["sts.amazonaws.com"]
+    }
+
+    # Restricts assumption to workflows running in this exact repository.
+    condition {
+      test     = "StringLike"
+      variable = "token.actions.githubusercontent.com:sub"
+      values = [
+        "repo:Isaac3924@17149928/spatial-registry-ui@1407917767:*"
+      ]
+    }
+  }
+}
+
+resource "aws_iam_role" "ui_github_actions" {
+  name               = "spatial-registry-ui-github-actions-role"
+  assume_role_policy = data.aws_iam_policy_document.ui_github_actions_assume_role.json
+
+  tags = {
+    Name = "spatial-registry-ui-github-actions-role"
+  }
+}
+
+data "aws_iam_policy_document" "ui_github_actions_permissions" {
+  statement {
+    sid    = "S3ObjectManagement"
+    effect = "Allow"
+    actions = [
+      "s3:PutObject",
+      "s3:DeleteObject",
+    ]
+    resources = ["${aws_s3_bucket.frontend.arn}/*"]
+  }
+
+  statement {
+    sid       = "S3ListBucket"
+    effect    = "Allow"
+    actions   = ["s3:ListBucket"]
+    resources = [aws_s3_bucket.frontend.arn]
+  }
+
+  statement {
+    sid       = "CloudFrontInvalidation"
+    effect    = "Allow"
+    actions   = ["cloudfront:CreateInvalidation"]
+    resources = [aws_cloudfront_distribution.frontend.arn]
+  }
+}
+
+resource "aws_iam_policy" "ui_github_actions" {
+  name        = "spatial-registry-ui-github-actions-policy"
+  description = "Allows GitHub Actions to deploy the frontend to S3 and invalidate the CloudFront cache"
+  policy      = data.aws_iam_policy_document.ui_github_actions_permissions.json
+}
+
+resource "aws_iam_role_policy_attachment" "ui_github_actions" {
+  role       = aws_iam_role.ui_github_actions.name
+  policy_arn = aws_iam_policy.ui_github_actions.arn
+}
+
 ###############################################################################
 # Outputs
 ###############################################################################
@@ -321,4 +522,14 @@ output "ecs_service_name" {
 output "github_actions_role_arn" {
   description = "ARN of the IAM role GitHub Actions assumes via OIDC to deploy the service"
   value       = aws_iam_role.github_actions.arn
+}
+
+output "cloudfront_distribution_domain_name" {
+  description = "Domain name of the CloudFront distribution serving the frontend"
+  value       = aws_cloudfront_distribution.frontend.domain_name
+}
+
+output "ui_github_actions_role_arn" {
+  description = "ARN of the IAM role GitHub Actions assumes via OIDC to deploy the frontend"
+  value       = aws_iam_role.ui_github_actions.arn
 }
