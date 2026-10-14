@@ -183,7 +183,7 @@ resource "aws_lb_target_group" "api" {
   target_type = "ip"
 
   health_check {
-    path     = "/"
+    path     = "/api/v1/assets"
     protocol = "HTTP"
     matcher  = "200"
   }
