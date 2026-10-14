@@ -69,3 +69,14 @@ variable "container_image_tag" {
   type        = string
   default     = "latest"
 }
+
+variable "domain_name" {
+  description = "Root domain name with an existing Route 53 public hosted zone (e.g. example.com) used to serve the API over HTTPS"
+  type        = string
+}
+
+variable "api_subdomain" {
+  description = "Subdomain combined with domain_name to form the API's fully qualified domain name (e.g. api.example.com)"
+  type        = string
+  default     = "api"
+}

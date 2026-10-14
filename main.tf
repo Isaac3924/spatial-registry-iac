@@ -52,18 +52,26 @@ resource "aws_route_table_association" "public" {
 }
 
 ###############################################################################
-# Security Group
+# Security Groups
 ###############################################################################
 
-resource "aws_security_group" "ecs_service" {
-  name        = "${var.project_name}-ecs-sg"
-  description = "Allow inbound traffic on the API port and all outbound traffic"
+resource "aws_security_group" "alb" {
+  name        = "${var.project_name}-alb-sg"
+  description = "Allow inbound HTTP/HTTPS from anywhere and all outbound traffic"
   vpc_id      = aws_vpc.main.id
 
   ingress {
-    description = "API access from anywhere"
-    from_port   = var.container_port
-    to_port     = var.container_port
+    description = "HTTPS access from anywhere"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "HTTP access from anywhere (redirected to HTTPS)"
+    from_port   = 80
+    to_port     = 80
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
@@ -77,7 +85,154 @@ resource "aws_security_group" "ecs_service" {
   }
 
   tags = {
+    Name = "${var.project_name}-alb-sg"
+  }
+}
+
+resource "aws_security_group" "ecs_service" {
+  name        = "${var.project_name}-ecs-sg"
+  description = "Allow inbound traffic on the API port and all outbound traffic"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    description     = "API access from the ALB only"
+    from_port       = var.container_port
+    to_port         = var.container_port
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb.id]
+  }
+
+  egress {
+    description = "Allow all outbound traffic"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
     Name = "${var.project_name}-ecs-sg"
+  }
+}
+
+###############################################################################
+# Domain & DNS (Route 53 & ACM)
+###############################################################################
+
+data "aws_route53_zone" "main" {
+  name         = var.domain_name
+  private_zone = false
+}
+
+resource "aws_acm_certificate" "api" {
+  domain_name       = "${var.api_subdomain}.${var.domain_name}"
+  validation_method = "DNS"
+
+  lifecycle {
+    create_before_destroy = true
+  }
+
+  tags = {
+    Name = "${var.project_name}-api-cert"
+  }
+}
+
+resource "aws_route53_record" "cert_validation" {
+  for_each = {
+    for dvo in aws_acm_certificate.api.domain_validation_options : dvo.domain_name => {
+      name   = dvo.resource_record_name
+      record = dvo.resource_record_value
+      type   = dvo.resource_record_type
+    }
+  }
+
+  zone_id         = data.aws_route53_zone.main.zone_id
+  name            = each.value.name
+  type            = each.value.type
+  records         = [each.value.record]
+  ttl             = 60
+  allow_overwrite = true
+}
+
+resource "aws_acm_certificate_validation" "api" {
+  certificate_arn         = aws_acm_certificate.api.arn
+  validation_record_fqdns = [for record in aws_route53_record.cert_validation : record.fqdn]
+}
+
+###############################################################################
+# Load Balancing (ALB)
+###############################################################################
+
+resource "aws_lb" "api" {
+  name               = "${var.project_name}-alb"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.alb.id]
+  subnets            = aws_subnet.public[*].id
+
+  tags = {
+    Name = "${var.project_name}-alb"
+  }
+}
+
+resource "aws_lb_target_group" "api" {
+  name        = "${var.project_name}-tg"
+  port        = var.container_port
+  protocol    = "HTTP"
+  vpc_id      = aws_vpc.main.id
+  target_type = "ip"
+
+  health_check {
+    path     = "/"
+    protocol = "HTTP"
+    matcher  = "200"
+  }
+
+  tags = {
+    Name = "${var.project_name}-tg"
+  }
+}
+
+# Redirects all HTTP traffic to HTTPS; the ALB SG only needs port 80 open to
+# receive the redirect request itself.
+resource "aws_lb_listener" "http_redirect" {
+  load_balancer_arn = aws_lb.api.arn
+  port              = 80
+  protocol          = "HTTP"
+
+  default_action {
+    type = "redirect"
+
+    redirect {
+      port        = "443"
+      protocol    = "HTTPS"
+      status_code = "HTTP_301"
+    }
+  }
+}
+
+resource "aws_lb_listener" "https" {
+  load_balancer_arn = aws_lb.api.arn
+  port              = 443
+  protocol          = "HTTPS"
+  ssl_policy        = "ELBSecurityPolicy-2016-08"
+  certificate_arn   = aws_acm_certificate_validation.api.certificate_arn
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.api.arn
+  }
+}
+
+resource "aws_route53_record" "api" {
+  zone_id = data.aws_route53_zone.main.zone_id
+  name    = "${var.api_subdomain}.${var.domain_name}"
+  type    = "A"
+
+  alias {
+    name                   = aws_lb.api.dns_name
+    zone_id                = aws_lb.api.zone_id
+    evaluate_target_health = true
   }
 }
 
@@ -192,7 +347,16 @@ resource "aws_ecs_service" "api" {
     assign_public_ip = true
   }
 
-  depends_on = [aws_iam_role_policy_attachment.ecs_task_execution]
+  load_balancer {
+    target_group_arn = aws_lb_target_group.api.arn
+    container_name   = "${var.project_name}-container"
+    container_port   = var.container_port
+  }
+
+  depends_on = [
+    aws_iam_role_policy_attachment.ecs_task_execution,
+    aws_lb_listener.https,
+  ]
 
   tags = {
     Name = "${var.project_name}-service"
@@ -532,4 +696,9 @@ output "cloudfront_distribution_domain_name" {
 output "ui_github_actions_role_arn" {
   description = "ARN of the IAM role GitHub Actions assumes via OIDC to deploy the frontend"
   value       = aws_iam_role.ui_github_actions.arn
+}
+
+output "api_base_url" {
+  description = "Fully qualified HTTPS URL for the API"
+  value       = "https://${var.api_subdomain}.${var.domain_name}"
 }
